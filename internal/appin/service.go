@@ -166,8 +166,9 @@ type Query struct {
 
 func (q *Query) String() string {
 	var s string
+	s = `(fields/CustomerType eq 'Change borrower' or fields/CustomerType eq 'C4C_Transfer' or fields/CustomerType eq 'C4C_Topup' or fields/CustomerType eq 'C4C_Normal' or fields/CustomerType eq 'EXC' or fields/CustomerType eq 'FL-EXC' or fields/CustomerType eq 'FL-NEW' or fields/CustomerType eq 'MC' or fields/CustomerType eq 'New' or fields/CustomerType eq 'Old' or fields/CustomerType eq 'Used Car') and `
 	if q.Product != "" {
-		s = "fields/ServiceType eq '" + q.Product + "' and "
+		s += "fields/ServiceType eq '" + q.Product + "' and "
 	}
 
 	if !q.CreatedAfter.IsZero() && !q.CreatedBefore.IsZero() {
