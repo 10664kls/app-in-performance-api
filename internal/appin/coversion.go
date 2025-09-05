@@ -33,15 +33,9 @@ type Overview struct {
 
 	// ProductMetrics is the product metrics of App-In.
 	ProductMetrics []*ProductMetrics `json:"productMetrics"`
-}
 
-// BestTimeExecutor is the executor with the best time used for App-In.
-type BestTimeExecutor struct {
-	// DisplayName is the display name of the executor.
-	DisplayName string `json:"displayName"`
-
-	// BestTime is the best time used for App-In.
-	BestTime time.Duration `json:"bestTime"`
+	// CAFinalOverview is the CA operation performed by App-In.
+	CAFinalOverview *CAFinalOverview `json:"caFinalOverview"`
 }
 
 func newOverview(appIns []*AppIn) *Overview {
@@ -54,14 +48,69 @@ func newOverview(appIns []*AppIn) *Overview {
 	o.Conversion = newConversion(appIns)
 	o.Leaderboards = createLeaderboards(performances)
 
-	convertedIntervals := createTimeIntervalsByConverted(appIns)
-	o.TimeIntervalsByConverted = convertedIntervals
+	o.TimeIntervalsByConverted = createTimeIntervalsByConverted(appIns)
 	o.BestTimeUsed = findBestTimeUsedByExecutor(performances)
 
 	o.TimeIntervalsByPending = createTimeIntervalsByPending(appIns)
 	o.ProductMetrics = calculatePerformanceConversionMetricsByProduct(appIns)
 
 	return o
+}
+
+// SetCAFinal sets the CA operation performed by App-In.
+func (o *Overview) SetCAFinal(ca []*CAFinal) {
+	o.CAFinalOverview = newCAFinalOverview(ca)
+}
+
+func newCAFinalOverview(appins []*CAFinal) *CAFinalOverview {
+	groups := groupCAFinalByExecutor(appins)
+	performances := calculateCAFinalConversionMetricsByExecutor(groups)
+
+	c := new(CAFinalOverview)
+	c.ActiveExecutor = int64(len(groups))
+	c.TopPerformer = getTopPerformer(performances)
+	c.Leaderboards = createLeaderboards(performances)
+	c.BestTimeUsed = findBestTimeUsedByExecutor(performances)
+
+	c.Conversion = newCAFinalConversion(appins)
+	c.TimeIntervalsByConverted = createCAFinalTimeIntervalsByConverted(appins)
+	c.TimeIntervalsByPending = createCAFinalTimeIntervalsByPending(appins)
+
+	return c
+}
+
+// CAFinalOverview is the CA operation performed by App-In.
+type CAFinalOverview struct {
+	// ActiveExecutor is the number of active executor.
+	ActiveExecutor int64 `json:"activeExecutor"`
+
+	// TopPerformer is the top performer who performed the most App-In.
+	TopPerformer *TopPerformer `json:"topPerformer"`
+
+	// Conversion is the conversion rate.
+	Conversion *Conversion `json:"conversion"`
+
+	// TimeIntervalsByConverted is the time intervals for converted App-In.
+	TimeIntervalsByConverted []*TimeInterval `json:"timeIntervalsByConverted"`
+
+	// TimeIntervalsByPending is the time intervals for pending App-In.
+	TimeIntervalsByPending []*TimeInterval `json:"timeIntervalsByPending"`
+
+	// BestTimeUsed is the executor with the best time used for App-In.
+	BestTimeUsed *BestTimeExecutor `json:"bestTimeUsed"`
+
+	// Leaderboard is the leaderboard of App-In.
+	// Top 5 performers
+	Leaderboards []*Leaderboard `json:"leaderboards"`
+}
+
+// BestTimeExecutor is the executor with the best time used for App-In.
+type BestTimeExecutor struct {
+	// DisplayName is the display name of the executor.
+	DisplayName string `json:"displayName"`
+
+	// BestTime is the best time used for App-In.
+	BestTime time.Duration `json:"bestTime"`
 }
 
 // Conversion is the conversion rate.
@@ -201,6 +250,65 @@ func newConversion(appIns []*AppIn) *Conversion {
 	var conversionRate, fastestPercent float32
 	var averageTime time.Duration
 
+	processed := converted + notPassed
+	if total > 0 {
+		conversionRate = float32(processed) / float32(total) * 100
+		if processed > 0 {
+			averageTime = sum / time.Duration(processed)
+		}
+	}
+
+	if processed > 0 {
+		fastestPercent = float32(fastestCount) / float32(processed) * 100
+	}
+
+	return &Conversion{
+		Total:          total,
+		Converted:      converted,
+		Rate:           conversionRate,
+		AverageTime:    averageTime,
+		NeedAttention:  needAttention,
+		Fastest:        fastestCount,
+		BestTime:       bestTime,
+		FastestPercent: fastestPercent,
+		NotPassed:      notPassed,
+	}
+}
+
+func newCAFinalConversion(cs []*CAFinal) *Conversion {
+	total := int64(len(cs))
+
+	var sum, bestTime time.Duration
+	var fastestCount, needAttention, converted int64
+	const threshold = 5 * time.Hour
+
+	for _, c := range cs {
+		status := strings.ToLower(c.Status)
+		if len(status) > 0 && status == "completed" && c.CompletedAt != nil {
+			converted++
+			duration := c.CompletedAt.Sub(c.CreatedAt)
+			sum += duration
+
+			if duration <= time.Minute*30 {
+				fastestCount++
+			}
+
+			if (bestTime == 0 || duration < bestTime) && duration >= time.Minute {
+				bestTime = duration
+			}
+		}
+
+		if status != "completed" && c.CompletedAt == nil {
+			duration := time.Since(c.CreatedAt)
+			if duration > threshold {
+				needAttention++
+			}
+		}
+	}
+
+	var conversionRate, fastestPercent float32
+	var averageTime time.Duration
+
 	if total > 0 {
 		conversionRate = float32(converted) / float32(total) * 100
 		if converted > 0 {
@@ -221,7 +329,6 @@ func newConversion(appIns []*AppIn) *Conversion {
 		Fastest:        fastestCount,
 		BestTime:       bestTime,
 		FastestPercent: fastestPercent,
-		NotPassed:      notPassed,
 	}
 }
 
@@ -242,6 +349,19 @@ func getTopPerformer(conversions map[string]*performerMetric) *TopPerformer {
 
 func groupAppInByExecutor(appIns []*AppIn) map[string][]*AppIn {
 	groups := make(map[string][]*AppIn, 0)
+	for _, a := range appIns {
+		if a.Executor == "" {
+			continue
+		}
+
+		groups[a.Executor] = append(groups[a.Executor], a)
+	}
+
+	return groups
+}
+
+func groupCAFinalByExecutor(appIns []*CAFinal) map[string][]*CAFinal {
+	groups := make(map[string][]*CAFinal, 0)
 	for _, a := range appIns {
 		if a.Executor == "" {
 			continue
@@ -330,6 +450,20 @@ func calculatePerformanceConversionMetricsByExecutor(groups map[string][]*AppIn)
 			DisplayName:  executor,
 			Conversion:   newConversion(apps),
 			Performances: createTimeIntervalsByConverted(apps),
+		}
+	}
+
+	return performers
+}
+
+func calculateCAFinalConversionMetricsByExecutor(groups map[string][]*CAFinal) map[string]*performerMetric {
+	performers := make(map[string]*performerMetric, 0)
+
+	for executor, cs := range groups {
+		performers[executor] = &performerMetric{
+			DisplayName:  executor,
+			Conversion:   newCAFinalConversion(cs),
+			Performances: createCAFinalTimeIntervalsByConverted(cs),
 		}
 	}
 
@@ -511,4 +645,104 @@ func findBestTimeUsedByExecutor(p map[string]*performerMetric) *BestTimeExecutor
 		DisplayName: bestExecutor,
 		BestTime:    bestTime,
 	}
+}
+
+func createCAFinalTimeIntervalsByConverted(cs []*CAFinal) []*TimeInterval {
+	titles := []string{
+		"<30min",
+		"<1h",
+		"<2h",
+		"<3h",
+		"<4h",
+		"<5h",
+		"5h+",
+	}
+
+	intervals := make(map[string]int64)
+	for _, t := range titles {
+		intervals[t] = 0
+	}
+
+	for _, a := range cs {
+		status := strings.ToLower(a.Status)
+		if status == "completed" && a.CompletedAt != nil {
+			duration := a.CompletedAt.Sub(a.CreatedAt)
+			switch {
+			case duration < 30*time.Minute:
+				intervals["<30min"]++
+			case duration < time.Hour:
+				intervals["<1h"]++
+			case duration < 2*time.Hour:
+				intervals["<2h"]++
+			case duration < 3*time.Hour:
+				intervals["<3h"]++
+			case duration < 4*time.Hour:
+				intervals["<4h"]++
+			case duration < 5*time.Hour:
+				intervals["<5h"]++
+			default:
+				intervals["5h+"]++
+			}
+		}
+	}
+
+	ts := make([]*TimeInterval, 0)
+	for _, t := range titles {
+		ts = append(ts, &TimeInterval{
+			Title: t,
+			Total: intervals[t],
+		})
+	}
+
+	return ts
+}
+
+func createCAFinalTimeIntervalsByPending(cs []*CAFinal) []*TimeInterval {
+	titles := []string{
+		"<30min",
+		"<1h",
+		"<2h",
+		"<3h",
+		"<4h",
+		"<5h",
+		"5h+",
+	}
+
+	intervals := make(map[string]int64)
+	for _, t := range titles {
+		intervals[t] = 0
+	}
+
+	now := time.Now()
+	for _, a := range cs {
+		if strings.ToLower(a.Status) != "completed" && a.CompletedAt == nil {
+			duration := now.Sub(a.CreatedAt)
+			switch {
+			case duration < 30*time.Minute:
+				intervals["<30min"]++
+			case duration < time.Hour:
+				intervals["<1h"]++
+			case duration < 2*time.Hour:
+				intervals["<2h"]++
+			case duration < 3*time.Hour:
+				intervals["<3h"]++
+			case duration < 4*time.Hour:
+				intervals["<4h"]++
+			case duration < 5*time.Hour:
+				intervals["<5h"]++
+			default:
+				intervals["5h+"]++
+			}
+		}
+	}
+
+	ts := make([]*TimeInterval, 0)
+	for _, t := range titles {
+		ts = append(ts, &TimeInterval{
+			Title: t,
+			Total: intervals[t],
+		})
+	}
+
+	return ts
 }

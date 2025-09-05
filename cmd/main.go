@@ -45,13 +45,14 @@ func run() error {
 	zlog.Info("Logger initialized")
 
 	appInSvc, err := appin.NewService(ctx, &appin.Config{
-		Zlog:     zlog,
-		TenantID: os.Getenv("TENANT_ID"),
-		ClientID: os.Getenv("CLIENT_ID"),
-		Secret:   os.Getenv("CLIENT_SECRET"),
-		SiteID:   os.Getenv("SITE_ID"),
-		ListID:   os.Getenv("LIST_ID"),
-		Scopes:   []string{},
+		Zlog:          zlog,
+		TenantID:      os.Getenv("TENANT_ID"),
+		ClientID:      os.Getenv("CLIENT_ID"),
+		Secret:        os.Getenv("CLIENT_SECRET"),
+		SiteID:        os.Getenv("SITE_ID"),
+		ListID:        os.Getenv("LIST_ID"),
+		CAFinalListID: os.Getenv("CA_FINAL_LIST_ID"),
+		Scopes:        []string{},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create appin service: %w", err)

@@ -14,28 +14,24 @@ import (
 	"github.com/microsoftgraph/msgraph-sdk-go/models"
 	"github.com/microsoftgraph/msgraph-sdk-go/sites"
 	"go.uber.org/zap"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type Service struct {
-	client *graph.GraphServiceClient
-	zlog   *zap.Logger
-	siteID string
-	listID string
-}
-
-type Config struct {
-	Zlog     *zap.Logger
-	TenantID string
-	ClientID string
-	Secret   string
-	SiteID   string
-	ListID   string
-	Scopes   []string
+	client        *graph.GraphServiceClient
+	zlog          *zap.Logger
+	siteID        string
+	listID        string
+	caFinalListID string
 }
 
 func NewService(_ context.Context, config *Config) (*Service, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config is nil")
+	}
+	if err := config.Validate(); err != nil {
+		return nil, err
 	}
 
 	cred, err := azidentity.NewClientSecretCredential(config.TenantID, config.ClientID, config.Secret, nil)
@@ -49,11 +45,49 @@ func NewService(_ context.Context, config *Config) (*Service, error) {
 	}
 
 	return &Service{
-		client: client,
-		siteID: config.SiteID,
-		listID: config.ListID,
-		zlog:   config.Zlog,
+		client:        client,
+		siteID:        config.SiteID,
+		listID:        config.ListID,
+		caFinalListID: config.CAFinalListID,
+		zlog:          config.Zlog,
 	}, nil
+}
+
+type Config struct {
+	Zlog          *zap.Logger
+	TenantID      string
+	ClientID      string
+	Secret        string
+	SiteID        string
+	ListID        string
+	CAFinalListID string
+	Scopes        []string
+}
+
+func (c Config) Validate() error {
+	if c.Zlog == nil {
+		return fmt.Errorf("zlog is nil")
+	}
+	if c.TenantID == "" {
+		return fmt.Errorf("tenantID is empty")
+	}
+	if c.ClientID == "" {
+		return fmt.Errorf("clientID is empty")
+	}
+	if c.Secret == "" {
+		return fmt.Errorf("secret is empty")
+	}
+	if c.SiteID == "" {
+		return fmt.Errorf("siteID is empty")
+	}
+	if c.ListID == "" {
+		return fmt.Errorf("listID is empty")
+	}
+	if c.CAFinalListID == "" {
+		return fmt.Errorf("caFinalListID is empty")
+	}
+
+	return nil
 }
 
 type ListAppInResult struct {
@@ -72,12 +106,40 @@ func (s *Service) ListAppIns(ctx context.Context, q *Query) (*ListAppInResult, e
 }
 
 func (s *Service) GetOverview(ctx context.Context, q *Query) (*Overview, error) {
-	as, err := s.listAppIns(ctx, q)
-	if err != nil {
+	var (
+		as []*AppIn
+		ca []*CAFinal
+	)
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() (err error) {
+		as, err = s.listAppIns(ctx, q)
+		if err != nil {
+			return err
+		}
+
+		return
+	})
+
+	g.Go(func() (err error) {
+		ca, err = s.listCAFinals(ctx, q)
+		if err != nil {
+			return err
+		}
+
+		return
+	})
+
+	if err := g.Wait(); err != nil {
+		s.zlog.Error("g.Wait failed", zap.Error(err))
 		return nil, err
 	}
 
-	return newOverview(as), nil
+	o := newOverview(as)
+	o.SetCAFinal(ca)
+
+	return o, nil
 }
 
 func (s *Service) listAppIns(ctx context.Context, q *Query) ([]*AppIn, error) {
@@ -139,6 +201,65 @@ func (s *Service) listAppIns(ctx context.Context, q *Query) ([]*AppIn, error) {
 	return as, nil
 }
 
+func (s *Service) listCAFinals(ctx context.Context, q *Query) ([]*CAFinal, error) {
+	zlog := s.zlog.With(
+		zap.String("method", "listCAFinals"),
+		zap.Any("query", q),
+	)
+
+	as := make([]*CAFinal, 0)
+	config := newCAFinalReqConfig(q)
+
+	res, err := s.client.Sites().
+		BySiteId(s.siteID).
+		Lists().
+		ByListId(s.caFinalListID).
+		Items().
+		Get(ctx, config)
+	if err != nil {
+		zlog.Error("failed to get list items", zap.Error(err))
+		return nil, err
+	}
+
+	pager, err := core.NewPageIterator[*models.ListItem](res, s.client.GetAdapter(), models.CreateListItemCollectionResponseFromDiscriminatorValue)
+	if err != nil {
+		zlog.Error("failed to create page iterator", zap.Error(err))
+		return nil, err
+	}
+
+	if err := pager.Iterate(ctx, func(pageItem *models.ListItem) bool {
+		if pageItem.GetFields() == nil {
+			return false
+		}
+
+		byt, err := json.Marshal(pageItem.GetFields().GetAdditionalData())
+		if err != nil {
+			zlog.
+				With(
+					zap.Any("fields", pageItem.GetFields().GetAdditionalData()),
+				).Error("failed to marshal fields", zap.Error(err))
+			return false
+		}
+
+		a := new(rawCAFinal)
+		if err := json.Unmarshal(byt, a); err != nil {
+			zlog.
+				With(
+					zap.String("byt", string(byt)),
+				).Error("failed to unmarshal fields", zap.Error(err))
+			return false
+		}
+
+		as = append(as, newAppInFromRawCAFinal(a))
+		return true
+	}); err != nil {
+		zlog.Error("failed to iterate page", zap.Error(err))
+		return nil, err
+	}
+
+	return as, nil
+}
+
 func newQueryParams(q *Query) *sites.ItemListsItemItemsRequestBuilderGetQueryParameters {
 	return &sites.ItemListsItemItemsRequestBuilderGetQueryParameters{
 		Expand: []string{
@@ -149,6 +270,25 @@ func newQueryParams(q *Query) *sites.ItemListsItemItemsRequestBuilderGetQueryPar
 			"fields/Created desc",
 		},
 		Top: to.Ptr[int32](500),
+	}
+}
+
+func newCAFinalQueryParams(q *Query) *sites.ItemListsItemItemsRequestBuilderGetQueryParameters {
+	return &sites.ItemListsItemItemsRequestBuilderGetQueryParameters{
+		Expand: []string{
+			`fields($select=FL,Fullname,CAFinalAssign,CaseStatus,FinalEndTime,AssignTime)`,
+		},
+		Filter: to.Ptr(q.ToCAFinalQueryString()),
+		Orderby: []string{
+			"fields/Created desc",
+		},
+		Top: to.Ptr[int32](500),
+	}
+}
+
+func newCAFinalReqConfig(q *Query) *sites.ItemListsItemItemsRequestBuilderGetRequestConfiguration {
+	return &sites.ItemListsItemItemsRequestBuilderGetRequestConfiguration{
+		QueryParameters: newCAFinalQueryParams(q),
 	}
 }
 
@@ -192,6 +332,22 @@ func (q *Query) String() string {
 	return strings.TrimSuffix(s, " and ")
 }
 
+func (q *Query) ToCAFinalQueryString() string {
+	var s string
+	if !q.CreatedAfter.IsZero() && !q.CreatedBefore.IsZero() {
+		s += fmt.Sprintf(`fields/Created ge '%s' and fields/Created le '%s'`, q.CreatedAfter.Format(time.RFC3339), q.CreatedBefore.Format(time.RFC3339))
+	}
+
+	if !q.CreatedAfter.IsZero() && q.CreatedBefore.IsZero() {
+		s += fmt.Sprintf(`fields/Created ge '%s'`, q.CreatedAfter.Format(time.RFC3339))
+	}
+
+	if q.CreatedAfter.IsZero() && !q.CreatedBefore.IsZero() {
+		s += fmt.Sprintf(`fields/Created le '%s'`, q.CreatedBefore.Format(time.RFC3339))
+	}
+	return s
+}
+
 type rawAppIn struct {
 	LONumber           string     `json:"LOFacility"`
 	Product            string     `json:"ServiceType"`
@@ -206,6 +362,24 @@ type rawAppIn struct {
 	CreatedBy          string     `json:"Author"`
 	CompletedAt        *time.Time `json:"CompletedDateTime"`
 	CreatedAt          time.Time  `json:"Created"`
+}
+
+type rawCAFinal struct {
+	Number      string     `json:"FL"`
+	DisplayName string     `json:"Fullname"`
+	Executor    string     `json:"CAFinalAssign"`
+	Status      string     `json:"CaseStatus"`
+	CompletedAt *time.Time `json:"FinalEndTime"`
+	CreatedAt   time.Time  `json:"AssignTime"`
+}
+
+type CAFinal struct {
+	Number      string     `json:"number"`
+	DisplayName string     `json:"displayName"`
+	Executor    string     `json:"executor"`
+	Status      string     `json:"status"`
+	CompletedAt *time.Time `json:"completedAt"`
+	CreatedAt   time.Time  `json:"createdAt"`
 }
 
 type AppIn struct {
@@ -239,5 +413,16 @@ func newAppInFromRawAppIn(a *rawAppIn) *AppIn {
 		CreatedBy:          a.CreatedBy,
 		CompletedAt:        a.CompletedAt,
 		CreatedAt:          a.CreatedAt,
+	}
+}
+
+func newAppInFromRawCAFinal(a *rawCAFinal) *CAFinal {
+	return &CAFinal{
+		Number:      a.Number,
+		DisplayName: a.DisplayName,
+		Status:      a.Status,
+		Executor:    a.Executor,
+		CompletedAt: a.CompletedAt,
+		CreatedAt:   a.CreatedAt,
 	}
 }
