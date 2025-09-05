@@ -12,9 +12,6 @@ type Overview struct {
 	// ActiveExecutor is the number of active executor.
 	ActiveExecutor int64 `json:"activeExecutor"`
 
-	// BestTimeSlot is the best time slot for App-In.
-	BestTimeSlot string `json:"bestTimeSlot"`
-
 	// TopPerformer is the top performer who performed the most App-In.
 	TopPerformer *TopPerformer `json:"topPerformer"`
 
@@ -27,12 +24,24 @@ type Overview struct {
 	// TimeIntervalsByPending is the time intervals for pending App-In.
 	TimeIntervalsByPending []*TimeInterval `json:"timeIntervalsByPending"`
 
+	// BestTimeUsed is the executor with the best time used for App-In.
+	BestTimeUsed *BestTimeExecutor `json:"bestTimeUsed"`
+
 	// Leaderboard is the leaderboard of App-In.
 	// Top 5 performers
 	Leaderboards []*Leaderboard `json:"leaderboards"`
 
 	// ProductMetrics is the product metrics of App-In.
 	ProductMetrics []*ProductMetrics `json:"productMetrics"`
+}
+
+// BestTimeExecutor is the executor with the best time used for App-In.
+type BestTimeExecutor struct {
+	// DisplayName is the display name of the executor.
+	DisplayName string `json:"displayName"`
+
+	// BestTime is the best time used for App-In.
+	BestTime time.Duration `json:"bestTime"`
 }
 
 func newOverview(appIns []*AppIn) *Overview {
@@ -47,7 +56,7 @@ func newOverview(appIns []*AppIn) *Overview {
 
 	convertedIntervals := createTimeIntervalsByConverted(appIns)
 	o.TimeIntervalsByConverted = convertedIntervals
-	o.BestTimeSlot = findBestTimeSlot(convertedIntervals)
+	o.BestTimeUsed = findBestTimeUsedByExecutor(performances)
 
 	o.TimeIntervalsByPending = createTimeIntervalsByPending(appIns)
 	o.ProductMetrics = calculatePerformanceConversionMetricsByProduct(appIns)
@@ -63,10 +72,13 @@ type Conversion struct {
 	// Converted is the number of App-In converted.
 	Converted int64 `json:"converted"`
 
+	// NotPassed is the number of App-In not passed.
+	NotPassed int64 `json:"notPassed"`
+
 	// Rate is the conversion rate.
 	Rate float32 `json:"rate"`
 
-	// Fastest is the number of App-In performed in the shortest time. Under 1h.
+	// Fastest is the number of App-In performed in the shortest time. Under 30min.
 	Fastest int64 `json:"fastest"`
 
 	// FastestPercent is the percentage of App-In performed in the shortest time.
@@ -74,6 +86,9 @@ type Conversion struct {
 
 	// Slowest is the number of App-In performed in the longest time. Over 5h.
 	NeedAttention int64 `json:"needAttention"`
+
+	// BestTime is the best time used for App-In.
+	BestTime time.Duration `json:"bestTime"`
 
 	// AverageTime is the average time for App-in performed.
 	AverageTime time.Duration `json:"averageTime"`
@@ -104,6 +119,12 @@ type Leaderboard struct {
 	// ConversionRate is the conversion rate of the performer.
 	ConversionRate float32 `json:"conversionRate"`
 
+	// AverageTime is the average time for App-in performed by the performer.
+	AverageTime time.Duration `json:"averageTime"`
+
+	// BestTime is the best time used for App-In by the performer.
+	BestTime time.Duration `json:"bestTime"`
+
 	// Performances is the performance of the performer for each time interval.
 	Performances []*TimeInterval `json:"performances"`
 }
@@ -118,6 +139,9 @@ type ProductMetrics struct {
 
 	// Converted is the number of App-In converted for the product.
 	Converted int64 `json:"converted"`
+
+	// NotPassed is the number of App-In not passed for the product.
+	NotPassed int64 `json:"notPassed"`
 
 	// ConversionRate is the conversion rate for the product.
 	ConversionRate float32 `json:"conversionRate"`
@@ -142,26 +166,35 @@ type TopPerformer struct {
 func newConversion(appIns []*AppIn) *Conversion {
 	total := int64(len(appIns))
 
-	var sum time.Duration
-	var fastestCount, needAttention, converted int64
+	var sum, bestTime time.Duration
+	var fastestCount, needAttention, converted, notPassed int64
 	const threshold = 5 * time.Hour
 
 	for _, appIn := range appIns {
-		if strings.ToLower(appIn.Status) != "pending" && len(appIn.Status) > 0 && appIn.CompletedAt != nil {
+		status := strings.ToLower(appIn.Status)
+		if len(status) > 0 && !strings.Contains(status, "not pass") && appIn.CompletedAt != nil {
 			converted++
 			duration := appIn.CompletedAt.Sub(appIn.CreatedAt)
 			sum += duration
 
-			if duration <= time.Hour {
+			if duration <= time.Minute*30 {
 				fastestCount++
+			}
+
+			if (bestTime == 0 || duration < bestTime) && duration >= time.Minute {
+				bestTime = duration
 			}
 		}
 
-		if (strings.ToLower(appIn.Status) == "pending" || appIn.Status == "") && appIn.CompletedAt == nil {
+		if status == "" && appIn.CompletedAt == nil {
 			duration := time.Since(appIn.CreatedAt)
 			if duration > threshold {
 				needAttention++
 			}
+		}
+
+		if strings.Contains(status, "not pass") {
+			notPassed++
 		}
 	}
 
@@ -186,7 +219,9 @@ func newConversion(appIns []*AppIn) *Conversion {
 		AverageTime:    averageTime,
 		NeedAttention:  needAttention,
 		Fastest:        fastestCount,
+		BestTime:       bestTime,
 		FastestPercent: fastestPercent,
+		NotPassed:      notPassed,
 	}
 }
 
@@ -225,8 +260,29 @@ func groupAppInByProduct(appIns []*AppIn) map[string][]*AppIn {
 			continue
 		}
 
-		key := fmt.Sprintf("%s | %s", a.Type, a.Product)
-		groups[key] = append(groups[key], a)
+		switch strings.ToLower(a.Product) {
+		case "sale auto":
+			switch {
+			case strings.Contains(strings.ToLower(a.Type), "c4c"):
+				key := fmt.Sprintf(`C4C | %s`, a.Product)
+				groups[key] = append(groups[key], a)
+
+			case strings.Contains(strings.ToLower(a.Type), "used car"):
+				key := fmt.Sprintf(`Used Car | %s`, a.Product)
+				groups[key] = append(groups[key], a)
+
+			case strings.Contains(strings.ToLower(a.Type), "mc"):
+				key := fmt.Sprintf(`MC | %s`, a.Product)
+				groups[key] = append(groups[key], a)
+
+			default:
+				groups[a.Product] = append(groups[a.Product], a)
+			}
+
+		default:
+			groups[a.Product] = append(groups[a.Product], a)
+		}
+
 	}
 
 	return groups
@@ -244,8 +300,24 @@ func calculatePerformanceConversionMetricsByProduct(appIns []*AppIn) []*ProductM
 			Converted:      c.Converted,
 			ConversionRate: c.Rate,
 			AverageTime:    c.AverageTime,
+			NotPassed:      c.NotPassed,
 		})
 	}
+
+	sort.Slice(products, func(i, j int) bool {
+		// Sort by Converted count (descending)
+		if products[i].Converted != products[j].Converted {
+			return products[i].Converted > products[j].Converted
+		}
+
+		// If Converted count is the same, sort by Conversion rate (descending)
+		if products[i].ConversionRate != products[j].ConversionRate {
+			return products[i].ConversionRate > products[j].ConversionRate
+		}
+
+		// If rates are also the same, sort by average time (ascending)
+		return products[i].AverageTime < products[j].AverageTime
+	})
 
 	return products
 }
@@ -302,6 +374,8 @@ func createLeaderboards(conversions map[string]*performerMetric) []*Leaderboard 
 			Total:          p.Conversion.Total,
 			ConversionRate: p.Conversion.Rate,
 			Performances:   p.Performances,
+			AverageTime:    p.Conversion.AverageTime,
+			BestTime:       p.Conversion.BestTime,
 		})
 
 		// Limit to top 5
@@ -315,6 +389,7 @@ func createLeaderboards(conversions map[string]*performerMetric) []*Leaderboard 
 
 func createTimeIntervalsByConverted(appIns []*AppIn) []*TimeInterval {
 	titles := []string{
+		"<30min",
 		"<1h",
 		"<2h",
 		"<3h",
@@ -329,9 +404,12 @@ func createTimeIntervalsByConverted(appIns []*AppIn) []*TimeInterval {
 	}
 
 	for _, a := range appIns {
-		if strings.ToLower(a.Status) != "pending" && len(a.Status) > 0 && a.CompletedAt != nil {
+		status := strings.ToLower(a.Status)
+		if len(a.Status) > 0 && !strings.Contains(status, "not pass") && a.CompletedAt != nil {
 			duration := a.CompletedAt.Sub(a.CreatedAt)
 			switch {
+			case duration < 30*time.Minute:
+				intervals["<30min"]++
 			case duration < time.Hour:
 				intervals["<1h"]++
 			case duration < 2*time.Hour:
@@ -361,6 +439,7 @@ func createTimeIntervalsByConverted(appIns []*AppIn) []*TimeInterval {
 
 func createTimeIntervalsByPending(appIns []*AppIn) []*TimeInterval {
 	titles := []string{
+		"<30min",
 		"<1h",
 		"<2h",
 		"<3h",
@@ -376,9 +455,11 @@ func createTimeIntervalsByPending(appIns []*AppIn) []*TimeInterval {
 
 	now := time.Now()
 	for _, a := range appIns {
-		if (strings.ToLower(a.Status) == "pending" || a.Status == "") && a.CompletedAt == nil {
+		if a.Status == "" && a.CompletedAt == nil {
 			duration := now.Sub(a.CreatedAt)
 			switch {
+			case duration < 30*time.Minute:
+				intervals["<30min"]++
 			case duration < time.Hour:
 				intervals["<1h"]++
 			case duration < 2*time.Hour:
@@ -406,20 +487,28 @@ func createTimeIntervalsByPending(appIns []*AppIn) []*TimeInterval {
 	return ts
 }
 
-func findBestTimeSlot(timeIntervals []*TimeInterval) string {
-	if len(timeIntervals) == 0 {
-		return ""
-	}
-
-	var bestSlotTitle string
-	var highestTotal int64 = 0
-
-	for _, interval := range timeIntervals {
-		if interval.Total > highestTotal {
-			highestTotal = interval.Total
-			bestSlotTitle = interval.Title
+func findBestTimeUsedByExecutor(p map[string]*performerMetric) *BestTimeExecutor {
+	if len(p) == 0 {
+		return &BestTimeExecutor{
+			DisplayName: "N/A",
+			BestTime:    0,
 		}
 	}
 
-	return bestSlotTitle
+	var bestExecutor string
+	var bestTime time.Duration
+
+	for executor, metric := range p {
+		if metric.Conversion.BestTime > 0 {
+			if bestTime == 0 || metric.Conversion.BestTime < bestTime {
+				bestTime = metric.Conversion.BestTime
+				bestExecutor = executor
+			}
+		}
+	}
+
+	return &BestTimeExecutor{
+		DisplayName: bestExecutor,
+		BestTime:    bestTime,
+	}
 }
